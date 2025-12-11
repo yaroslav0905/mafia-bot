@@ -74,6 +74,8 @@ const distributeRoles = (players, mafiaCountChoice) => {
         isAlive: true,
         nightAction: null, 
         dayVote: null,
+        // *** НОВОЕ ПОЛЕ ***
+        selfHealedOnce: false, // Отслеживание самолечения Доктора
     }));
 };
 
@@ -108,12 +110,10 @@ bot.onText(/\/start/, (msg) => {
                 ? [[{ text: '▶️ Начать ДНЕВНОЕ ГОЛОСОВАНИЕ (Только Админ)', callback_data: 'start_day_admin' }]]
                 : []
             ),
-            // Кнопка для старта игры (только если идет регистрация)
             ...(game.status === 'registration' 
                 ? [[{ text: `▶️ Начать игру (${game.players.length}/${MIN_PLAYERS}+)`, callback_data: 'start_game_choice' }]]
                 : []
             ),
-            // Кнопка сброса
             [{ text: '❌ Перезапустить/Сбросить игру', callback_data: 'admin_reset' }] 
         ];
         
@@ -207,6 +207,7 @@ bot.on('callback_query', async (callbackQuery) => {
             isAlive: true,
             nightAction: null, 
             dayVote: null,
+            selfHealedOnce: false, // Инициализация
         });
         
         const count = game.players.length;
@@ -415,6 +416,11 @@ bot.on('callback_query', async (callbackQuery) => {
         
         if (role === 'DOCTOR') {
             game.night.doctorSaveId = targetId;
+            // *** ЛОГИКА САМОЛЕЧЕНИЯ ***
+            if (targetId === userId) {
+                player.selfHealedOnce = true;
+                await bot.sendMessage(userId, `💉 Вы **использовали** свою единственную возможность вылечить себя за игру!`, { parse_mode: 'Markdown' });
+            }
         } else if (role === 'SHERIFF') {
             game.night.sheriffCheckId = targetId;
             const result = (targetPlayer.role === 'MAFIA' || targetPlayer.role === 'DON_MAFIA') ? 'МАФИЯ' : 'МИРНЫЙ';
@@ -580,7 +586,7 @@ function startIntroduction(game) {
             case 'DOCTOR':
                 privateMessage = 
                     `**Ваша роль:** ${ROLE_NAMES['DOCTOR']}\n` +
-                    `**Ваши действия:** каждую ночь вы можете выбрать одного игрока которого вы хотите вылечить.`;
+                    `**Ваши действия:** каждую ночь вы можете выбрать одного игрока которого вы хотите вылечить. Вы можете **вылечить себя только один раз** за игру.`;
                 break;
                 
             case 'SHERIFF':
@@ -641,6 +647,8 @@ function startNight(game) {
 
     for (const player of alivePlayers) {
         
+        let excludeId = null;
+
         switch (player.role) {
             case 'DON_MAFIA':
                 sendDonMafiaCheckRequest(game, player.userId, alivePlayers);
@@ -657,7 +665,13 @@ function startNight(game) {
                 }
                 
             case 'DOCTOR':
-                sendGenericNightActionRequest(game, player.userId, 'DOCTOR', alivePlayers);
+                // *** ЛОГИКА ОГРАНИЧЕНИЯ САМОЛЕЧЕНИЯ ***
+                if (player.selfHealedOnce) {
+                    // Если Доктор уже лечил себя, исключаем его из списка целей
+                    excludeId = player.userId;
+                    bot.sendMessage(player.userId, `⚠️ **Внимание!** Вы уже использовали свою единственную возможность вылечить себя. Выберите другого игрока.`, { parse_mode: 'Markdown' });
+                }
+                sendGenericNightActionRequest(game, player.userId, 'DOCTOR', alivePlayers, excludeId);
                 break;
                 
             case 'SHERIFF':
@@ -718,6 +732,8 @@ function startMafiaKillVote(game, initiatingUserId) {
 }
 
 function sendGenericNightActionRequest(game, userId, role, alivePlayers, excludeId = null) {
+    // В отличие от стандартного createPlayerButtons, здесь excludeId используется
+    // для исключения цели, которую нельзя выбрать (например, Доктор себя)
     const buttons = createPlayerButtons(alivePlayers, excludeId);
     const actionData = `night_action_${role}`;
 
