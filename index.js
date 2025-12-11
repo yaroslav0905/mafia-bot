@@ -3,32 +3,33 @@
 const TelegramBot = require('node-telegram-bot-api');
 
 // --- 1. КОНФИГУРАЦИЯ ---
-// !!! ВСТАВЬТЕ СЮДА ВАШ ТОКЕН !!!
 const TOKEN = '8585291816:AAEccYuGINy4U4ByAInVLfbVmNOBTO2irps'; 
-const MIN_PLAYERS = 4;
+const MIN_PLAYERS = 4; // Минимальное количество игроков для старта
+const MIN_PLAYERS_FOR_2_MAFIA = 6; // Минимальное количество для 2 мафиози (Дон + Мафия)
 
-const bot = new TelegramBot(TOKEN, { polling: true });
-console.log('Бот Мафия запущен...');
+if (!TOKEN) {
+    console.error("❌ Ошибка: Переменная окружения BOT_TOKEN не установлена.");
+    process.exit(1); 
+}
+
+const bot = new TelegramBot(TOKEN, { polling: true }); 
+console.log('✅ Бот Мафия запущен...');
 
 // --- 2. ХРАНЕНИЕ СОСТОЯНИЯ ИГРЫ И ЛОКАЛИЗАЦИЯ ---
 const activeGames = {};
 
 const ROLE_NAMES = {
     'MAFIA': 'МАФИЯ',
+    'DON_MAFIA': 'ДОН МАФИИ',
     'DOCTOR': 'ДОКТОР',
     'SHERIFF': 'ШЕРИФ',
     'CIVILIAN': 'МИРНЫЙ ЖИТЕЛЬ'
 };
 
-// ... (Описание объекта игры без изменений) ...
-
-
 // --- 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
-// Функция для получения списка живых игроков
 const getAlivePlayers = (game) => game.players.filter(p => p.isAlive);
 
-// Функция для создания кнопок игроков (inline_keyboard)
 const createPlayerButtons = (players, excludeUserId = null) => {
     return players
         .filter(p => p.isAlive && p.userId !== excludeUserId)
@@ -38,10 +39,9 @@ const createPlayerButtons = (players, excludeUserId = null) => {
         }]);
 };
 
-// Функция для проверки условий победы
 const checkWinCondition = (game) => {
     const alivePlayers = getAlivePlayers(game);
-    const mafiaCount = alivePlayers.filter(p => p.role === 'MAFIA').length;
+    const mafiaCount = alivePlayers.filter(p => p.role === 'MAFIA' || p.role === 'DON_MAFIA').length;
     const civilianCount = alivePlayers.length - mafiaCount;
 
     if (mafiaCount === 0) {
@@ -53,12 +53,19 @@ const checkWinCondition = (game) => {
     return null;
 };
 
-// Функция распределения ролей
-const distributeRoles = (players) => {
-    let roles = ['MAFIA', 'SHERIFF', 'DOCTOR'];
+const distributeRoles = (players, mafiaCountChoice) => {
+    let roles = [];
+    
+    if (mafiaCountChoice === 2) {
+        roles.push('DON_MAFIA', 'MAFIA', 'SHERIFF', 'DOCTOR');
+    } else { 
+        roles.push('MAFIA', 'SHERIFF', 'DOCTOR');
+    }
+    
     for (let i = roles.length; i < players.length; i++) {
         roles.push('CIVILIAN');
     }
+    
     roles.sort(() => Math.random() - 0.5);
 
     return players.map((player, index) => ({
@@ -87,13 +94,12 @@ bot.onText(/\/start/, (msg) => {
         );
     }
     
-    // --- МЕНЮ АДМИНИСТРАТОРА (Для Групповых чатов) ---
+    // --- МЕНЮ АДМИНИСТРАТОРА ---
     if (game && game.status !== 'finished') {
         const aliveCount = getAlivePlayers(game).length;
         
         const adminKeyboard = [
             [{ text: '🔄 Статус игры', callback_data: 'admin_status' }],
-            // Добавляем кнопки в зависимости от текущей фазы
             ...(game.status === 'introduction'
                 ? [[{ text: '🌙 Начать НОЧЬ (Только Админ)', callback_data: 'start_night_admin' }]]
                 : []
@@ -104,10 +110,11 @@ bot.onText(/\/start/, (msg) => {
             ),
             // Кнопка для старта игры (только если идет регистрация)
             ...(game.status === 'registration' 
-                ? [[{ text: `▶️ Начать игру (${game.players.length}/${MIN_PLAYERS}+)`, callback_data: 'start_game_admin' }]]
+                ? [[{ text: `▶️ Начать игру (${game.players.length}/${MIN_PLAYERS}+)`, callback_data: 'start_game_choice' }]]
                 : []
             ),
-            [{ text: '❌ Перезапустить/Сбросить игру', callback_data: 'admin_reset' }]
+            // Кнопка сброса
+            [{ text: '❌ Перезапустить/Сбросить игру', callback_data: 'admin_reset' }] 
         ];
         
         return bot.sendMessage(chatId, 
@@ -116,14 +123,19 @@ bot.onText(/\/start/, (msg) => {
         );
     }
     
-    // --- НАЧАЛО РЕГИСТРАЦИИ (Если игра неактивна) ---
+    // --- НАЧАЛО РЕГИСТРАЦИИ ---
     activeGames[chatId] = {
         chatId: chatId,
         adminId: userId,
         status: 'registration',
         round: 0,
         players: [],
-        night: {},
+        night: {
+            mafiaKillTargetId: null, 
+            mafiaCheckTargetId: null,
+            doctorSaveId: null,
+            sheriffCheckId: null,
+        },
         dayVotes: {},
         killedThisNight: null,
     };
@@ -135,7 +147,7 @@ bot.onText(/\/start/, (msg) => {
             reply_markup: {
                 inline_keyboard: [
                     [{ text: `Присоединиться (0/${MIN_PLAYERS}+)`, callback_data: 'join_game' }],
-                    [{ text: 'Начать игру (Только Админ)', callback_data: 'start_game_admin' }]
+                    [{ text: 'Начать игру (Только Админ)', callback_data: 'start_game_choice' }]
                 ]
             }
         }
@@ -165,36 +177,19 @@ bot.on('callback_query', async (callbackQuery) => {
     
     if (!game) return bot.answerCallbackQuery(callbackQuery.id, { text: 'Игра неактивна или не найдена.', show_alert: true });
 
-    // --- 0. КОМАНДЫ АДМИНИСТРАТОРА ИЗ МЕНЮ ---
-    
-    if (data === 'admin_status') {
-         if (userId !== game.adminId) {
-             return bot.answerCallbackQuery(callbackQuery.id, { text: 'Только администратор может смотреть статус.', show_alert: true });
-         }
-         const aliveCount = getAlivePlayers(game).length;
-         const initialCount = game.players.length;
-
-         let statusText = `
-### 📊 Статус Игры "Мафия"
-* **Раунд:** ${game.round === 0 ? 'Регистрация' : game.round}
-* **Этап:** ${game.status.toUpperCase()}
-* **Игроков (Живых/Начало):** ${aliveCount} / ${initialCount}
-* **Администратор:** ${game.players.find(p => p.userId === game.adminId)?.username || game.adminId}
-         `;
-
-         return bot.answerCallbackQuery(callbackQuery.id, statusText, { show_alert: true, parse_mode: 'Markdown' });
-    }
-    
+    // --- A.1. Сброс/Перезапуск Игры (admin_reset) ---
     if (data === 'admin_reset') {
-         if (userId !== game.adminId) {
-             return bot.answerCallbackQuery(callbackQuery.id, { text: 'Только администратор может перезапустить игру.', show_alert: true });
-         }
-         
-         delete activeGames[chatId];
-         bot.sendMessage(chatId, '❌ **Игра сброшена.** Начните новую игру командой /start.');
-         return bot.answerCallbackQuery(callbackQuery.id, { text: 'Игра сброшена.' });
+        if (userId !== game.adminId) {
+            return bot.answerCallbackQuery(callbackQuery.id, { text: 'Только администратор может сбросить игру.', show_alert: true });
+        }
+        
+        delete activeGames[chatId];
+        
+        bot.sendMessage(chatId, '❌ **Игра сброшена.** Начните новую игру командой /start.');
+        
+        return bot.answerCallbackQuery(callbackQuery.id, { text: 'Игра сброшена.' });
     }
-
+    
     // --- A. Этап РЕГИСТРАЦИИ (join_game) ---
     if (data === 'join_game' && game.status === 'registration') {
         const existingPlayer = game.players.find(p => p.userId === userId);
@@ -218,7 +213,7 @@ bot.on('callback_query', async (callbackQuery) => {
         bot.editMessageReplyMarkup({
             inline_keyboard: [
                 [{ text: `Присоединиться (${count}/${MIN_PLAYERS}+)`, callback_data: 'join_game' }],
-                [{ text: 'Начать игру (Только Админ)', callback_data: 'start_game_admin' }]
+                [{ text: 'Начать игру (Только Админ)', callback_data: 'start_game_choice' }]
             ]
         }, {
             chat_id: chatId,
@@ -227,9 +222,9 @@ bot.on('callback_query', async (callbackQuery) => {
         
         return bot.answerCallbackQuery(callbackQuery.id, { text: `Вы присоединились! Всего: ${count}` });
     }
-    
-    // --- B. Старт ИГРЫ (start_game_admin) ---
-    if (data === 'start_game_admin' && game.status === 'registration') {
+
+    // --- B. Выбор количества мафии (start_game_choice) ---
+    if (data === 'start_game_choice' && game.status === 'registration') {
         if (userId !== game.adminId) {
             return bot.answerCallbackQuery(callbackQuery.id, { text: 'Только администратор может начать игру.', show_alert: true });
         }
@@ -237,16 +232,39 @@ bot.on('callback_query', async (callbackQuery) => {
         if (game.players.length < MIN_PLAYERS) {
             return bot.answerCallbackQuery(callbackQuery.id, { text: `Нужно минимум ${MIN_PLAYERS} игроков. Сейчас: ${game.players.length}`, show_alert: true });
         }
+        
+        let keyboard = [
+            [{ text: '1 игрок Мафии (МАФИЯ)', callback_data: 'start_game_1' }],
+        ];
 
-        game.players = distributeRoles(game.players);
+        if (game.players.length >= MIN_PLAYERS_FOR_2_MAFIA) {
+            keyboard.push([{ text: '2 игрока Мафии (ДОН + МАФИЯ)', callback_data: 'start_game_2' }]);
+        }
+
+        return bot.editMessageText(`🛠️ **НАСТРОЙКА ИГРЫ**\n\nВыберите количество игроков Мафии:`, {
+            chat_id: chatId,
+            message_id: message.message_id,
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: keyboard }
+        });
+    }
+
+    // --- B1. Старт ИГРЫ (start_game_1/2) ---
+    if (data.startsWith('start_game_') && game.status === 'registration') {
+        if (userId !== game.adminId) {
+            return bot.answerCallbackQuery(callbackQuery.id, { text: 'Только администратор может начать игру.', show_alert: true });
+        }
+        
+        const mafiaCountChoice = parseInt(data.split('_')[2]); // 1 или 2
+        
+        game.players = distributeRoles(game.players, mafiaCountChoice);
         game.status = 'introduction'; 
         game.round = 1;
         
-        // 1. Отправляем сообщение о начале игры и списке
         const playersList = game.players.map(p => `• ${p.username}`).join('\n');
         
         bot.editMessageText(
-            `\n\n\n🚀 **ИГРА НАЧАЛАСЬ!** 🚀\n\nУчаствуют: ${game.players.length} человек.\n**Проверьте свои личные сообщения** — вам отправлены ваши роли!\n\n**Список участников:**\n${playersList}`,
+            `\n\n\n🚀 **ИГРА НАЧАЛАСЬ!** 🚀\n\nУчаствуют: ${game.players.length} человек. (Мафии: ${mafiaCountChoice}) \n**Проверьте свои личные сообщения** — вам отправлены ваши роли!\n\n**Список участников:**\n${playersList}`,
             {
                 chat_id: chatId,
                 message_id: message.message_id,
@@ -254,7 +272,6 @@ bot.on('callback_query', async (callbackQuery) => {
             }
         );
         
-        // 2. Запускаем фазу знакомства (отправка ЛС + сообщение в чат с кнопкой)
         startIntroduction(game);
 
         return bot.answerCallbackQuery(callbackQuery.id, { text: 'Игра запущена!' });
@@ -266,7 +283,6 @@ bot.on('callback_query', async (callbackQuery) => {
             return bot.answerCallbackQuery(callbackQuery.id, { text: 'Только администратор может начать ночь.', show_alert: true });
         }
 
-        // Удаляем кнопку "Начать ночь" и переходим к фазе ночи
         bot.editMessageText(`🌙 **НАСТУПАЕТ НОЧЬ!** Все уснули.`, {
              chat_id: chatId,
              message_id: message.message_id,
@@ -276,7 +292,114 @@ bot.on('callback_query', async (callbackQuery) => {
         return bot.answerCallbackQuery(callbackQuery.id, { text: 'Начинается первая ночь.' });
     }
 
-    // --- C. Действия НОЧЬЮ (night_action_ROLE_TARGETID_group_GROUPID) ---
+    // --- C.1. Действие ДОНА МАФИИ: Проверка Шерифа (night_action_check_TARGETID) ---
+    if (data.startsWith('night_action_check_') && game.status === 'night') {
+        const targetId = parseInt(data.split('_')[3]);
+        const player = game.players.find(p => p.userId === userId);
+
+        if (!player || player.role !== 'DON_MAFIA' || !player.isAlive) {
+            return bot.answerCallbackQuery(callbackQuery.id, { text: 'Вы не Дон Мафии или не в игре.' });
+        }
+        
+        const targetPlayer = game.players.find(p => p.userId === targetId);
+        
+        game.night.mafiaCheckTargetId = targetId;
+
+        const result = targetPlayer.role === 'SHERIFF' ? 'ШЕРИФ' : 'НЕ ШЕРИФ';
+        await bot.sendMessage(userId, `🔎 Результат проверки:\nИгрок **${targetPlayer.username}** — **${result}**!`, { parse_mode: 'Markdown' });
+
+        await bot.editMessageText(`✅ Вы выбрали ${targetPlayer.username} для проверки.`, {
+            chat_id: userId,
+            message_id: message.message_id
+        });
+        
+        return startMafiaKillVote(game, userId);
+    }
+    
+    // --- C.2. Действия Мафии: Первоначальный выбор жертвы (night_action_mafia_vote_TARGETID) ---
+    if (data.startsWith('night_action_mafia_vote_') && game.status === 'night') {
+        const targetId = parseInt(data.split('_')[4]); 
+        const player = game.players.find(p => p.userId === userId);
+        
+        if (!player || !(player.role === 'MAFIA' || player.role === 'DON_MAFIA') || !player.isAlive) {
+             return bot.answerCallbackQuery(callbackQuery.id, { text: 'Вы не Мафия или не в игре.' });
+        }
+        
+        game.night.mafiaKillTargetId = targetId;
+
+        if (game.players.filter(p => (p.role === 'MAFIA' || p.role === 'DON_MAFIA') && p.isAlive).length === 1) {
+            player.nightAction = targetId;
+            await bot.editMessageText(`✅ Вы выбрали **${game.players.find(p => p.userId === targetId).username}**. Ожидаем завершения действий других ролей.`, {
+                chat_id: userId,
+                message_id: message.message_id,
+                parse_mode: 'Markdown'
+            });
+            checkNightActions(game);
+            return bot.answerCallbackQuery(callbackQuery.id, { text: 'Ваш выбор учтен.' });
+        }
+
+        if (player.role === 'DON_MAFIA') {
+             await bot.editMessageText(`✅ Вы (Дон Мафии) предложили убить **${game.players.find(p => p.userId === targetId).username}**. Ожидаем согласия напарника.`, {
+                chat_id: userId,
+                message_id: message.message_id,
+                parse_mode: 'Markdown'
+             });
+        } else if (player.role === 'MAFIA') {
+             await bot.editMessageText(`✅ Вы (Мафия) предложили убить **${game.players.find(p => p.userId === targetId).username}**. Ожидаем согласия Дона Мафии.`, {
+                chat_id: userId,
+                message_id: message.message_id,
+                parse_mode: 'Markdown'
+             });
+        }
+        
+        return sendMafiaAgreementRequest(game, userId, targetId);
+    }
+
+    // --- C.3. Согласие / Предложение (night_action_agree / night_action_propose) ---
+    if (data.startsWith('night_action_agree_') && game.status === 'night') {
+        const targetId = game.night.mafiaKillTargetId;
+        if (!targetId) return bot.answerCallbackQuery(callbackQuery.id, { text: 'Цель для убийства не выбрана.' });
+        
+        const player = game.players.find(p => p.userId === userId);
+        player.nightAction = targetId; 
+
+        bot.editMessageText(`✅ Вы согласились на убийство **${game.players.find(p => p.userId === targetId).username}**. Ожидаем завершения действий других ролей.`, {
+            chat_id: userId,
+            message_id: message.message_id,
+            parse_mode: 'Markdown'
+        });
+        
+        const proposer = game.players.find(p => p.userId !== userId && p.role in {'MAFIA':1, 'DON_MAFIA':1} && p.isAlive);
+        if (proposer) proposer.nightAction = targetId;
+        
+        checkNightActions(game); 
+        return bot.answerCallbackQuery(callbackQuery.id, { text: 'Согласие учтено.' });
+    }
+
+    if (data.startsWith('night_action_propose_') && game.status === 'night') {
+        const player = game.players.find(p => p.userId === userId);
+        
+        game.night.mafiaKillTargetId = null; 
+        
+        const otherMafia = game.players.find(p => 
+            (p.role === 'MAFIA' || p.role === 'DON_MAFIA') && p.isAlive && p.userId !== userId
+        );
+        if (otherMafia) {
+            bot.sendMessage(otherMafia.userId, `Ваш напарник (**${player.username}**) предложил иного игрока. Ждите нового предложения.`);
+        }
+        
+        await bot.editMessageText(`❌ Предложите новую жертву:`, {
+            chat_id: userId,
+            message_id: message.message_id,
+            parse_mode: 'Markdown'
+        });
+
+        startMafiaKillVote(game, userId);
+        
+        return bot.answerCallbackQuery(callbackQuery.id, { text: 'Переголосование начато.' });
+    }
+    
+    // --- C.4. Действия Доктора/Шерифа/Мирного ---
     if (data.startsWith('night_action_') && game.status === 'night') {
         const parts = data.split('_'); 
         const role = parts[2]; 
@@ -284,27 +407,22 @@ bot.on('callback_query', async (callbackQuery) => {
 
         const player = game.players.find(p => p.userId === userId);
         
-        if (!player || !player.isAlive) {
-             return bot.answerCallbackQuery(callbackQuery.id, { text: 'Вы не в игре.' });
+        if (!player || !player.isAlive || player.role === 'DON_MAFIA' || player.role === 'MAFIA') { 
+             return bot.answerCallbackQuery(callbackQuery.id, { text: 'Неверная роль или вы не в игре.' });
         }
         
         const targetPlayer = game.players.find(p => p.userId === targetId);
         
-        // --- ЗАПИСЬ ДЕЙСТВИЯ ---
-        if (role === 'MAFIA') {
-            game.night.mafiaTargetId = targetId;
-        } else if (role === 'DOCTOR') {
+        if (role === 'DOCTOR') {
             game.night.doctorSaveId = targetId;
         } else if (role === 'SHERIFF') {
             game.night.sheriffCheckId = targetId;
-            const result = targetPlayer.role === 'MAFIA' ? 'МАФИЯ' : 'МИРНЫЙ';
+            const result = (targetPlayer.role === 'MAFIA' || targetPlayer.role === 'DON_MAFIA') ? 'МАФИЯ' : 'МИРНЫЙ';
             await bot.sendMessage(userId, `🔎 Результат проверки:\nИгрок **${targetPlayer.username}** — это **${result}**!`, { parse_mode: 'Markdown' });
         } 
         
-        // Все игроки (включая мирных) записывают nightAction
         player.nightAction = targetId; 
 
-        // --- ОБНОВЛЕНИЕ КНОПКИ В ЛС ---
         let confirmationMessage;
         if (role === 'CIVILIAN') {
              confirmationMessage = `✅ Вы выбрали игрока ${targetPlayer.username} и пожелали ему спокойной ночи.`;
@@ -320,14 +438,13 @@ bot.on('callback_query', async (callbackQuery) => {
         checkNightActions(game);
         return bot.answerCallbackQuery(callbackQuery.id, { text: 'Ваш выбор учтен.' });
     }
-    
+
     // --- D. Результат НОЧИ (show_night_result_admin) ---
     if (data === 'show_night_result_admin' && game.status === 'night_end') {
         if (userId !== game.adminId) {
             return bot.answerCallbackQuery(callbackQuery.id, { text: 'Только администратор может показать результат.', show_alert: true });
         }
         
-        // Заменяем сообщение с кнопкой на сообщение о результате и переходим в фазу дня
         const messageId = message.message_id;
         showNightResult(game, messageId);
         
@@ -340,11 +457,10 @@ bot.on('callback_query', async (callbackQuery) => {
              return bot.answerCallbackQuery(callbackQuery.id, { text: 'Только администратор может начать голосование.', show_alert: true });
          }
          
-         // Удаляем кнопку "Начать голосование"
          bot.editMessageReplyMarkup(
              { inline_keyboard: [] },
              { chat_id: chatId, message_id: message.message_id }
-         ).catch(() => {}); // Игнорируем ошибку, если сообщение уже отредактировано
+         ).catch(() => {});
 
          startDay(game);
          return bot.answerCallbackQuery(callbackQuery.id, { text: 'Начинается дневное голосование.' });
@@ -365,14 +481,12 @@ bot.on('callback_query', async (callbackQuery) => {
 
         voter.dayVote = targetId;
         
-        // Сообщение в ЛС об успешном голосовании
         bot.editMessageText(`✅ Вы проголосовали против **${target.username}**. Ожидаем остальных...`, {
             chat_id: userId,
             message_id: message.message_id,
             parse_mode: 'Markdown'
         });
 
-        // Обновляем статус голосования в общем чате и проверяем завершение
         updateVotingStatus(game, voter.username, target.username);
         
         return bot.answerCallbackQuery(callbackQuery.id, { text: 'Ваш голос учтен.' });
@@ -400,10 +514,12 @@ bot.on('callback_query', async (callbackQuery) => {
         bot.sendMessage(chatId, 'Игра полностью завершена. Спасибо за участие! Начните новую игру: /start');
         return bot.answerCallbackQuery(callbackQuery.id);
     }
+    
+    return bot.answerCallbackQuery(callbackQuery.id, { text: 'Неизвестное действие.' });
 });
 
 /**
- * 4.3. Команда /reset - Быстрый сброс игры
+ * 4.3. Команда /reset
  */
 bot.onText(/\/reset/, (msg) => {
     const chatId = msg.chat.id;
@@ -429,31 +545,59 @@ bot.onText(/\/reset/, (msg) => {
  * 5.0. Фаза Знакомства (Introduction)
  */
 function startIntroduction(game) {
-    const roleDescriptions = {
-        'MAFIA': {
-            title: ROLE_NAMES['MAFIA'],
-            description: 'каждую ночь вы выбираете жертву которую хотите убить'
-        },
-        'DOCTOR': {
-            title: ROLE_NAMES['DOCTOR'],
-            description: 'каждую ночь вы можете выбрать одного игрока которого вы хотите вылечить'
-        },
-        'SHERIFF': {
-            title: ROLE_NAMES['SHERIFF'],
-            description: 'каждую ночью вы можете проверить одного игрока и узнать его роль в игре'
-        },
-        'CIVILIAN': {
-            title: ROLE_NAMES['CIVILIAN'],
-            description: 'ночью у вас нет дел вы можете спать спокойно'
-        }
-    };
+    
+    const donMafia = game.players.find(p => p.role === 'DON_MAFIA' && p.isAlive);
+    const simpleMafia = game.players.find(p => p.role === 'MAFIA' && p.isAlive);
+    
+    const mafiaCountTotal = game.players.filter(p => p.role === 'DON_MAFIA' || p.role === 'MAFIA').length;
 
     for (const player of game.players) {
-        const roleInfo = roleDescriptions[player.role];
-        const privateMessage = 
-            `**Ваша роль:** ${roleInfo.title}\n` +
-            `**Ваши действия:** ${roleInfo.description}`;
-        
+        let privateMessage;
+
+        switch (player.role) {
+            case 'DON_MAFIA':
+                const mafiaNameForDon = simpleMafia ? simpleMafia.username : 'ОДИН ИГРОК';
+                privateMessage = 
+                    `**Ваша роль:** ${ROLE_NAMES['DON_MAFIA']}\n` +
+                    `**Ваши действия:** вы глава мафии и принимаете окончательное решение во всех делах, каждую ночь вы можете проверить одного игрока является ли он **ШЕРИФОМ** и получите ответ, а также вместе с игроком **МАФИЯ (${mafiaNameForDon})** выбираете жертву которую хотите убить.\n\n` +
+                    (simpleMafia ? `МАФИЯ: ${simpleMafia.username}` : '');
+                break;
+
+            case 'MAFIA':
+                if (mafiaCountTotal === 2) {
+                    const donNameForMafia = donMafia ? donMafia.username : 'ОДИН ИГРОК';
+                    privateMessage = 
+                        `**Ваша роль:** ${ROLE_NAMES['MAFIA']}\n` +
+                        `**Ваши действия:** каждую ночь вы вместе с игроком **ДОНОМ МАФИИ (${donNameForMafia})** выбираете жертву которую хотите убить.\n` +
+                        `ДОН МАФИИ: ${donMafia.username}`;
+                } else {
+                    privateMessage = 
+                        `**Ваша роль:** ${ROLE_NAMES['MAFIA']}\n` +
+                        `**Ваши действия:** каждую ночь вы выбираете жертву которую хотите убить.`;
+                }
+                break;
+                
+            case 'DOCTOR':
+                privateMessage = 
+                    `**Ваша роль:** ${ROLE_NAMES['DOCTOR']}\n` +
+                    `**Ваши действия:** каждую ночь вы можете выбрать одного игрока которого вы хотите вылечить.`;
+                break;
+                
+            case 'SHERIFF':
+                privateMessage = 
+                    `**Ваша роль:** ${ROLE_NAMES['SHERIFF']}\n` +
+                    `**Ваши действия:** каждую ночью вы можете проверить одного игрока и узнать его роль в игре (Мафия или Мирный).`;
+                break;
+                
+            case 'CIVILIAN':
+                privateMessage = 
+                    `**Ваша роль:** ${ROLE_NAMES['CIVILIAN']}\n` +
+                    `**Ваши действия:** ночью у вас нет дел вы можете спать спокойно.`;
+                break;
+            default:
+                continue;
+        }
+
         bot.sendMessage(player.userId, privateMessage, { 
             parse_mode: 'Markdown'
         }).catch(err => {
@@ -462,10 +606,9 @@ function startIntroduction(game) {
         });
     }
 
-    // Сообщение в общий чат (с кнопкой в конце)
     bot.sendMessage(game.chatId,
         `\n\n**ЗНАКОМСТВО**\n\n` + 
-        `Город знакомится с жителями, каждый представляется мирным, но впереди наступит ночь и тогда мафия сделает свой первый выстрел.`,
+        `Город знакомится с жителями...`,
         { 
             parse_mode: 'Markdown',
             reply_markup: {
@@ -479,89 +622,178 @@ function startIntroduction(game) {
 // 5.1. Начало Ночи
 function startNight(game) {
     game.status = 'night';
-    game.night = {}; 
+    game.night = {
+        mafiaKillTargetId: null,
+        mafiaCheckTargetId: null,
+        doctorSaveId: null,
+        sheriffCheckId: null,
+    }; 
     game.killedThisNight = null;
 
-    // Сброс ночных действий для всех игроков
     game.players.forEach(p => p.nightAction = null);
-
-    // Увеличиваем раунд, так как это новая ночь
     game.round++; 
 
     bot.sendMessage(game.chatId, 
-        `\n\n🌙 **РАУНД ${game.round}: НАСТУПАЕТ НОЧЬ!**\n\nВсе мирные жители спят. Мафия, Доктор и Шериф делают свой выбор в личных сообщениях.`
+        `\n\n🌙 **РАУНД ${game.round}: НАСТУПАЕТ НОЧЬ!**\n\nВсе мирные жители спят. Активные роли делают свой выбор в личных сообщениях.`
     );
 
     const alivePlayers = getAlivePlayers(game);
 
     for (const player of alivePlayers) {
-        let excludeId = null;
-        let privateMessage;
-        let actionData;
         
         switch (player.role) {
-            case 'MAFIA':
-                privateMessage = `😈 **МАФИЯ**, выберите жертву на эту ночь:`;
-                actionData = 'night_action_MAFIA';
-                excludeId = player.userId;
-                break;
-            case 'DOCTOR':
-                privateMessage = `🩺 **ДОКТОР**, выберите, кого вы спасете этой ночью (включая себя):`;
-                actionData = 'night_action_DOCTOR';
-                break;
-            case 'SHERIFF':
-                privateMessage = `🕵️‍♂️ **ШЕРИФ**, выберите, кого вы проверите:`;
-                actionData = 'night_action_SHERIFF';
-                excludeId = player.userId;
-                break;
-            case 'CIVILIAN':
-                privateMessage = `🏘️ **МИРНЫЙ ЖИТЕЛЬ**, ночью у вас нет дел, вы можете спать спокойно. Выберите игрока, которому пожелаете спокойной ночи.`;
-                actionData = 'night_action_CIVILIAN';
-                break;
-        }
-        
-       const buttons = createPlayerButtons(alivePlayers, excludeId);
-
-       const inlineKeyboard = buttons.map(row => 
-            row.map(btn => {
-                const targetIdFromVote = btn.callback_data.split('_')[1]; 
+            case 'DON_MAFIA':
+                sendDonMafiaCheckRequest(game, player.userId, alivePlayers);
+                continue; 
                 
-                return {
-                    text: btn.text,
-                    callback_data: `${actionData}_${targetIdFromVote}_group_${game.chatId}` 
-                };
-            })
-        );
-            
-        bot.sendMessage(player.userId, privateMessage, { 
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: inlineKeyboard }
-        }).catch(err => {
-             console.error(`Не удалось отправить сообщение ${player.username}:`, err.response?.body?.description || err.message);
-             bot.sendMessage(game.chatId, `⚠️ Не могу связаться с ${player.username}. Пожалуйста, начните диалог со мной в ЛС!`);
-        });
+            case 'MAFIA':
+                const donMafia = game.players.find(p => p.role === 'DON_MAFIA');
+                if (donMafia && donMafia.isAlive) {
+                    bot.sendMessage(player.userId, `🔪 **МАФИЯ**. Ждите распоряжения **Дона Мафии** (${donMafia.username}).`, { parse_mode: 'Markdown' });
+                    continue;
+                } else {
+                    startMafiaKillVote(game, player.userId);
+                    continue;
+                }
+                
+            case 'DOCTOR':
+                sendGenericNightActionRequest(game, player.userId, 'DOCTOR', alivePlayers);
+                break;
+                
+            case 'SHERIFF':
+                sendGenericNightActionRequest(game, player.userId, 'SHERIFF', alivePlayers, player.userId);
+                break;
+                
+            case 'CIVILIAN':
+                sendGenericNightActionRequest(game, player.userId, 'CIVILIAN', alivePlayers);
+                break;
+            default:
+                continue;
+        }
     }
 }
 
-// 5.2. Проверка действий ночи и переход к результату
+function sendDonMafiaCheckRequest(game, userId, alivePlayers) {
+    const buttons = createPlayerButtons(alivePlayers, userId);
+    const inlineKeyboard = buttons.map(row => 
+        row.map(btn => {
+            const targetIdFromVote = btn.callback_data.split('_')[1]; 
+            return {
+                text: btn.text,
+                callback_data: `night_action_check_${targetIdFromVote}_group_${game.chatId}` 
+            };
+        })
+    );
+        
+    bot.sendMessage(userId, `👑 **ДОН МАФИИ**, выберите игрока для **ПРОВЕРКИ НА ШЕРИФА**:`, { 
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: inlineKeyboard }
+    }).catch(() => {});
+}
+
+function startMafiaKillVote(game, initiatingUserId) {
+    const alivePlayers = getAlivePlayers(game);
+    const player = game.players.find(p => p.userId === initiatingUserId);
+    const isDon = player.role === 'DON_MAFIA';
+    
+    const excludeId = getAlivePlayers(game).filter(p => p.role === 'MAFIA' || p.role === 'DON_MAFIA').length > 1 ? initiatingUserId : null;
+    
+    const buttons = createPlayerButtons(alivePlayers, excludeId);
+    
+    const inlineKeyboard = buttons.map(row => 
+        row.map(btn => {
+            const targetIdFromVote = btn.callback_data.split('_')[1]; 
+            return {
+                text: btn.text,
+                callback_data: `night_action_mafia_vote_${targetIdFromVote}_group_${game.chatId}` 
+            };
+        })
+    );
+    
+    bot.sendMessage(initiatingUserId, 
+        `${isDon ? '🔥 **ДОН МАФИИ**' : '🔪 **МАФИЯ**'}, выберите **ЖЕРТВУ** на эту ночь:`, { 
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: inlineKeyboard }
+    }).catch(() => {});
+}
+
+function sendGenericNightActionRequest(game, userId, role, alivePlayers, excludeId = null) {
+    const buttons = createPlayerButtons(alivePlayers, excludeId);
+    const actionData = `night_action_${role}`;
+
+    const inlineKeyboard = buttons.map(row => 
+        row.map(btn => {
+            const targetIdFromVote = btn.callback_data.split('_')[1]; 
+            return {
+                text: btn.text,
+                callback_data: `${actionData}_${targetIdFromVote}_group_${game.chatId}` 
+            };
+        })
+    );
+    
+    const privateMessage = (role === 'DOCTOR' ? '🩺 **ДОКТОР**' : role === 'SHERIFF' ? '🕵️‍♂️ **ШЕРИФ**' : '🏘️ **МИРНЫЙ ЖИТЕЛЬ**') + `, сделайте свой выбор:`;
+        
+    bot.sendMessage(userId, privateMessage, { 
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: inlineKeyboard }
+    }).catch(() => {});
+}
+
+
+function sendMafiaAgreementRequest(game, proposerId, targetId) {
+    const proposer = game.players.find(p => p.userId === proposerId);
+    const target = game.players.find(p => p.userId === targetId);
+    
+    const otherMafia = game.players.find(p => 
+        (p.role === 'MAFIA' || p.role === 'DON_MAFIA') && p.isAlive && p.userId !== proposerId
+    );
+
+    if (!otherMafia) {
+        proposer.nightAction = targetId; 
+        return checkNightActions(game);
+    }
+    
+    const proposerRoleName = proposer.role === 'DON_MAFIA' ? 'ДОН МАФИИ' : 'МАФИЯ';
+
+    const requestMessage = 
+        `Ваш напарник (**${proposerRoleName}, ${proposer.username}**) предложил убить этой ночью **${target.username}**.\n\nСогласны?`;
+
+    const keyboard = [
+        [{ text: '✅ Согласиться', callback_data: `night_action_agree_${targetId}_group_${game.chatId}` }],
+        [{ text: '❌ Предложить иного игрока', callback_data: `night_action_propose_group_${game.chatId}` }]
+    ];
+    
+    bot.sendMessage(otherMafia.userId, requestMessage, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: keyboard }
+    }).catch(() => {});
+}
+
+
+// 5.2. Проверка действий ночи и переход к результату 
 function checkNightActions(game) {
     const alivePlayers = getAlivePlayers(game);
-    // Проверяем, что ВСЕ живые игроки сделали nightAction
-    const allPlayersDone = alivePlayers.every(p => p.nightAction !== null);
     
-    // Проверка действия Шерифа (отдельно, т.к. его результат отправляется сразу)
-    const sheriffNeeded = game.players.find(p => p.role === 'SHERIFF' && p.isAlive);
-    const sheriffDone = sheriffNeeded ? (game.night.sheriffCheckId !== undefined) : true;
+    const allMafia = alivePlayers.filter(p => p.role === 'MAFIA' || p.role === 'DON_MAFIA');
+    const nonMafia = alivePlayers.filter(p => p.role !== 'MAFIA' && p.role !== 'DON_MAFIA');
     
-    // Проверка действия Мафии и Доктора (через их поля в game.night)
-    const mafiaNeeded = game.players.find(p => p.role === 'MAFIA' && p.isAlive);
-    const doctorNeeded = game.players.find(p => p.role === 'DOCTOR' && p.isAlive);
+    const allNonMafiaDone = nonMafia.every(p => p.nightAction !== null);
+
+    let mafiaDone;
     
-    const mafiaDone = mafiaNeeded ? (game.night.mafiaTargetId !== undefined) : true;
-    const doctorDone = doctorNeeded ? (game.night.doctorSaveId !== undefined) : true;
+    if (allMafia.length === 1) {
+        mafiaDone = allMafia.every(p => p.nightAction !== null);
+    } else if (allMafia.length >= 2) {
+        const donMafia = allMafia.find(p => p.role === 'DON_MAFIA');
+        const donCheckDone = donMafia ? (game.night.mafiaCheckTargetId !== null) : true;
+        const allMafiaVoted = allMafia.every(p => p.nightAction !== null);
+        
+        mafiaDone = donCheckDone && allMafiaVoted;
+    } else {
+        mafiaDone = true; 
+    }
     
-    // Ночь завершена, если ВСЕ игроки (включая мирных) сделали ход
-    if (allPlayersDone && mafiaDone && doctorDone && sheriffDone) {
+    if (allNonMafiaDone && mafiaDone) {
         game.status = 'night_end';
         
         bot.sendMessage(game.chatId, 
@@ -580,41 +812,34 @@ function checkNightActions(game) {
 // 5.3. Объявление результата ночи
 function showNightResult(game, messageId) {
     
-    const targetId = game.night.mafiaTargetId;
+    const targetId = game.night.mafiaKillTargetId;
     const savedId = game.night.doctorSaveId;
 
     let resultMessage;
 
-    if (!targetId) {
-        resultMessage = 'Мафия не смогла договориться и никого не убила! Город в безопасности.';
+    if (!targetId || targetId === savedId) {
+        resultMessage = targetId ? 
+            `Мафия сделала свой выбор, но **Доктор** оказался рядом и спас жителя! Никто не погиб.` :
+            'Мафия не смогла договориться и никого не убила! Город в безопасности.';
     } else {
         const targetPlayer = game.players.find(p => p.userId === targetId);
 
-        if (targetId === savedId) {
-            // Скрываем имя игрока, если Доктор спас
-            resultMessage = `Мафия сделала свой выбор, но **Доктор** оказался рядом и спас жителя! Никто не погиб.`;
-        } else {
-            game.killedThisNight = targetId;
-            targetPlayer.isAlive = false;
-            
-            // Локализация роли убитого игрока
-            const roleInRussian = ROLE_NAMES[targetPlayer.role] || targetPlayer.role;
-            
-            resultMessage = `Мафия сделала свой выбор: 🩸 **${targetPlayer.username}** (роль: **${roleInRussian}**) был убит этой ночью.`;
-            
-            const winner = checkWinCondition(game);
-            if (winner) {
-                // Если игра завершена, то завершаем ее сразу
-                return endGame(game, winner);
-            }
+        game.killedThisNight = targetId;
+        targetPlayer.isAlive = false;
+        
+        const roleInRussian = ROLE_NAMES[targetPlayer.role] || targetPlayer.role;
+        
+        resultMessage = `Мафия сделала свой выбор: 🩸 **${targetPlayer.username}** (роль: **${roleInRussian}**) был убит этой ночью.`;
+        
+        const winner = checkWinCondition(game);
+        if (winner) {
+            return endGame(game, winner);
         }
     }
     
-    // Формируем финальное сообщение о ночи
     const finalNightMessage = 
         `--- 📰 НОЧНЫЕ НОВОСТИ ---\n${resultMessage}\n------------------\n\n${getAlivePlayers(game).length} игроков остаются в игре.`;
 
-    // Редактируем предыдущее сообщение, убирая кнопку "Показать результат"
     bot.editMessageText(finalNightMessage, {
         chat_id: game.chatId,
         message_id: messageId,
@@ -625,10 +850,8 @@ function showNightResult(game, messageId) {
         }
     });
     
-    // Переход в фазу объявления дня (пауза перед голосованием)
     game.status = 'day_announcement';
     
-    // Новое сообщение с кнопкой начала голосования
     bot.sendMessage(game.chatId, 
         `\n\n☀️ **НАСТУПАЕТ ДЕНЬ**\n\nГород собирается на суд! Обсудите, кто из вас Мафия, и начните голосование в личных сообщениях.`,
         {
@@ -650,7 +873,6 @@ function startDay(game) {
     const alivePlayers = getAlivePlayers(game);
     const playerButtons = createPlayerButtons(alivePlayers);
 
-    // Рассылка ЛС для голосования
     for (const player of alivePlayers) {
         const inlineKeyboard = playerButtons.map(row => 
             row.map(btn => {
@@ -675,17 +897,13 @@ function updateVotingStatus(game, voterUsername, targetUsername) {
     const aliveCount = alivePlayers.length;
     const votedCount = alivePlayers.filter(p => p.dayVote !== null).length;
     
-    // 1. Формируем сообщение о текущем голосе
     const statusText = 
         `🗳️ **ГОЛОСОВАНИЕ:** ${votedCount} / ${aliveCount} (${voterUsername}) проголосовал против **${targetUsername}**.`;
     
-    // 2. Отправляем статус голосования
     bot.sendMessage(game.chatId, statusText, { parse_mode: 'Markdown' }).then(() => {
-        // 3. После того как сообщение о голосе отправлено, проверяем, завершено ли голосование.
         if (votedCount === aliveCount) {
             game.status = 'day_end';
             
-            // 4. Отправляем финальное сообщение о завершении голосования
             bot.sendMessage(game.chatId, '📢 Все проголосовали. Результат готов!', {
                 reply_markup: {
                     inline_keyboard: [
@@ -697,11 +915,6 @@ function updateVotingStatus(game, voterUsername, targetUsername) {
     }).catch(err => console.error("Ошибка при отправке статуса голосования:", err));
 }
 
-// 5.6. Проверка голосов и переход к результату Дня (Эта функция теперь пустая, так как логика перенесена в updateVotingStatus)
-function checkDayVotes(game) {
-    // Эта функция теперь не нужна, так как вся логика перенесена в updateVotingStatus
-    // для гарантированного порядка сообщений.
-}
 
 // 5.7. Объявление результата Дня
 function showDayResult(game, messageId) {
@@ -720,7 +933,6 @@ function showDayResult(game, messageId) {
     const maxVotes = voteEntries.length > 0 ? voteEntries[0].count : 0;
     const leadingCandidates = voteEntries.filter(e => e.count === maxVotes);
 
-    // 1. Удаляем кнопку "Показать результат"
     bot.editMessageReplyMarkup(
         { inline_keyboard: [] },
         { chat_id: game.chatId, message_id: messageId }
@@ -736,7 +948,7 @@ function showDayResult(game, messageId) {
         const candidatesNames = leadingCandidates.map(c => game.players.find(p => p.userId === c.id).username);
         
         bot.sendMessage(game.chatId, 
-            `⚖️ **НИЧЬЯ!** Игроки **${candidatesNames.join('** и **')}** набрали одинаковое количество голосов (${maxVotes}). Город отправляется на дополнительное голосование! (Только между ними)`,
+            `⚖️ **НИЧЬЯ!** Игроки **${candidatesNames.join('** и **')}** набрали одинаковое количество голосов (${maxVotes}). Город отправляется на дополнительное голосование!`,
             { parse_mode: 'Markdown' }
         );
         
@@ -757,23 +969,17 @@ function showDayResult(game, messageId) {
         return;
     }
 
-    // --- ОБЪЯВЛЕНИЕ РЕЗУЛЬТАТА КАЗНИ ---
-    
     const executedPlayer = game.players.find(p => p.userId === leadingCandidates[0].id);
     executedPlayer.isAlive = false;
     
-    // Локализация роли казненного игрока
     const roleInRussian = ROLE_NAMES[executedPlayer.role] || executedPlayer.role;
 
-    // 2. Объявляем результат казни
     bot.sendMessage(game.chatId, 
-        `\n\n🔨 **РЕЗУЛЬТАТ СУДА**\n\nЖители подозревали каждого, но сделали свой выбор: **${executedPlayer.username}** (роль: **${roleInRussian}**) был казнен!`, 
+        `\n\n🔨 **РЕЗУЛЬТАТ СУДА**\n\nЖители сделали свой выбор: **${executedPlayer.username}** (роль: **${roleInRussian}**) был казнен!`, 
         { parse_mode: 'Markdown' }
     ).then(() => {
-        // 3. Проверяем условие победы и переходим дальше
         const winner = checkWinCondition(game);
         if (winner) {
-            // Вызов endGame после того, как объявлен результат суда
             return endGame(game, winner);
         }
         
@@ -792,7 +998,6 @@ function endGame(game, winner) {
         resultMessage = '🛡️ **ПОБЕДИЛИ МИРНЫЕ ЖИТЕЛИ!** Город очищен от зла.';
     }
     
-    // Локализация всех ролей для финального списка
     const allRoles = game.players.map(p => `• ${p.username}: ${ROLE_NAMES[p.role] || p.role}`).join('\n');
 
     bot.sendMessage(game.chatId, 
