@@ -74,8 +74,7 @@ const distributeRoles = (players, mafiaCountChoice) => {
         isAlive: true,
         nightAction: null, 
         dayVote: null,
-        // *** НОВОЕ ПОЛЕ ***
-        selfHealedOnce: false, // Отслеживание самолечения Доктора
+        selfHealedOnce: false, 
     }));
 };
 
@@ -207,7 +206,7 @@ bot.on('callback_query', async (callbackQuery) => {
             isAlive: true,
             nightAction: null, 
             dayVote: null,
-            selfHealedOnce: false, // Инициализация
+            selfHealedOnce: false, 
         });
         
         const count = game.players.length;
@@ -665,9 +664,7 @@ function startNight(game) {
                 }
                 
             case 'DOCTOR':
-                // *** ЛОГИКА ОГРАНИЧЕНИЯ САМОЛЕЧЕНИЯ ***
                 if (player.selfHealedOnce) {
-                    // Если Доктор уже лечил себя, исключаем его из списка целей
                     excludeId = player.userId;
                     bot.sendMessage(player.userId, `⚠️ **Внимание!** Вы уже использовали свою единственную возможность вылечить себя. Выберите другого игрока.`, { parse_mode: 'Markdown' });
                 }
@@ -710,9 +707,17 @@ function startMafiaKillVote(game, initiatingUserId) {
     const player = game.players.find(p => p.userId === initiatingUserId);
     const isDon = player.role === 'DON_MAFIA';
     
-    const excludeId = getAlivePlayers(game).filter(p => p.role === 'MAFIA' || p.role === 'DON_MAFIA').length > 1 ? initiatingUserId : null;
+    // 1. *** НОВАЯ ЛОГИКА ИСКЛЮЧЕНИЯ МАФИИ ***
+    const mafiaUserIds = alivePlayers
+        .filter(p => p.role === 'MAFIA' || p.role === 'DON_MAFIA')
+        .map(p => p.userId);
+
+    // 2. Формируем список целей: все, кто не является Мафией
+    const killTargets = alivePlayers.filter(p => !mafiaUserIds.includes(p.userId));
     
-    const buttons = createPlayerButtons(alivePlayers, excludeId);
+    // 3. Создаем кнопки, передавая null, так как список уже отфильтрован
+    const buttons = createPlayerButtons(killTargets, null);
+    // *** КОНЕЦ НОВОЙ ЛОГИКИ ***
     
     const inlineKeyboard = buttons.map(row => 
         row.map(btn => {
@@ -732,8 +737,6 @@ function startMafiaKillVote(game, initiatingUserId) {
 }
 
 function sendGenericNightActionRequest(game, userId, role, alivePlayers, excludeId = null) {
-    // В отличие от стандартного createPlayerButtons, здесь excludeId используется
-    // для исключения цели, которую нельзя выбрать (например, Доктор себя)
     const buttons = createPlayerButtons(alivePlayers, excludeId);
     const actionData = `night_action_${role}`;
 
